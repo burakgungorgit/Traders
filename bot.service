@@ -1,0 +1,16 @@
+[Unit]
+Description=Binance Trade Bot
+After=network.target
+
+[Service]
+User=ubuntu
+WorkingDirectory=/home/ubuntu/Traders
+ExecStart=/home/ubuntu/Traders/venv/bin/python /home/ubuntu/Traders/bot.py
+Restart=always
+RestartSec=30
+StandardOutput=append:/home/ubuntu/Traders/log.txt
+StandardError=append:/home/ubuntu/Traders/log.txt
+Environment="PYTHONUNBUFFERED=1"
+
+[Install]
+WantedBy=multi-user.target
