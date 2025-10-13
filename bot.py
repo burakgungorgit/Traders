@@ -224,8 +224,8 @@ def main():
 
             elif in_position:
                 current = float(client.get_symbol_ticker(symbol=SYMBOL)["price"])
-                target = entry_price * 1.04
-                stop = entry_price * 0.96
+                target = entry_price * 1.06
+                stop = entry_price * 0.97
 
                 if current >= target or current <= stop:
                     total_qty = get_balance("AVAX")
