@@ -48,7 +48,7 @@ def write_log(msg):
     send_telegram(full_msg, key=msg)  # spam kontrolü aktif
 
 # --- Log tekrarını sınırlı yaz ---
-def write_log_limited(msg, key, cooldown=300):
+def write_log_limited(msg, key, cooldown=1000):
     now = time.time()
     if key not in log_cooldowns or now - log_cooldowns[key] > cooldown:
         write_log(msg)
@@ -88,10 +88,18 @@ client = Client(API_KEY, API_SECRET)
 client.time_offset = -get_time_offset_ms()
 
 # --- Bot ayarları ---
-SYMBOL = "AVAXUSDT"
+SYMBOL = "BTCUSDT"
 INTERVAL = Client.KLINE_INTERVAL_30MINUTE
 COMMISSION = 0.001
 MIN_USDT = 10
+
+# --- Strateji parametreleri ---
+EMA_SHORT = 150
+EMA_LONG = 200
+TAKE_PROFIT_MULT = 1.08
+STOP_LOSS_MULT = 0.97
+STOPLOSS_ADJUST_TRIGGER = 1.05
+STOPLOSS_ADJUST_TO = 1.03
 
 # --- Bakiye kontrolü ---
 def get_balance(asset):
@@ -176,36 +184,38 @@ def buy_price(p): return p * (1 + COMMISSION)
 def sell_price(p): return p * (1 - COMMISSION)
 def calc_pnl(entry, current): return sell_price(current) - buy_price(entry)
 
+
 # --- Ana döngü ---
 def main():
-    write_log("Bot başlatıldı.")
+    write_log("BTCUSDT Bot başlatıldı.")
     state = load_state()
     in_position = state["in_position"]
     entry_price = state["entry_price"]
     write_log(f"Başlangıç durumu: in_position={in_position}, entry_price={entry_price}")
     awaiting_confirmation = False
     signal_time = None
+    adjusted_stop = False
 
     while True:
         try:
             df = get_klines(SYMBOL, INTERVAL)
-            if len(df) < 51:
+            if len(df) < EMA_LONG + 2:
                 time.sleep(60)
                 continue
 
-            df["ema20"] = calculate_ema(df, 20)
-            df["ema50"] = calculate_ema(df, 50)
+            df["ema_short"] = calculate_ema(df, EMA_SHORT)
+            df["ema_long"] = calculate_ema(df, EMA_LONG)
             prev, last = df.iloc[-2], df.iloc[-1]
 
             if not in_position and not awaiting_confirmation:
-                if prev["ema20"] < prev["ema50"] and last["ema20"] > last["ema50"]:
+                if prev["ema_short"] < prev["ema_long"] and last["ema_short"] > last["ema_long"]:
                     write_log("Sinyal oluştu. Mum kapanışı bekleniyor.")
                     signal_time = str(last["timestamp"])
                     awaiting_confirmation = True
 
             elif awaiting_confirmation:
                 if str(last["timestamp"]) != signal_time:
-                    if last["ema20"] > last["ema50"]:
+                    if last["ema_short"] > last["ema_long"]:
                         usdt = get_balance("USDT")
                         price = float(client.get_symbol_ticker(symbol=SYMBOL)["price"])
                         qty = round_quantity(SYMBOL, usdt * 0.99 / price)
@@ -215,7 +225,8 @@ def main():
                                 entry_price = get_avg_fill_price(order)
                                 in_position = True
                                 save_state({"in_position": True, "entry_price": entry_price})
-                                write_log(f"Alım yapıldı: {qty} AVAX @ {entry_price}")
+                                write_log(f"✅ Alım yapıldı: {qty} BTC @ {entry_price}")
+                                send_telegram(f"✅ ALIM: {qty} BTC @ {entry_price}")
                         else:
                             write_log("Yetersiz bakiye.")
                     else:
@@ -224,28 +235,38 @@ def main():
 
             elif in_position:
                 current = float(client.get_symbol_ticker(symbol=SYMBOL)["price"])
-                target = entry_price * 1.06
-                stop = entry_price * 0.97
+                target = entry_price * TAKE_PROFIT_MULT
+                stop = entry_price * STOP_LOSS_MULT
+
+                # Stop-loss ayarlaması (fiyat +%5’e ulaşırsa SL = entry*1.03)
+                if current >= entry_price * STOPLOSS_ADJUST_TRIGGER and not adjusted_stop:
+                    adjusted_stop = True
+                    stop = entry_price * STOPLOSS_ADJUST_TO
+                    write_log(f"🔒 Fiyat %5 yükseldi. SL {stop:.4f} seviyesine çekildi.")
+                    send_telegram(f"🔒 STOPLOSS GÜNCELLENDİ: Yeni SL = {stop:.4f}")
 
                 if current >= target or current <= stop:
-                    total_qty = get_balance("AVAX")
+                    total_qty = get_balance("BTC")
                     sell_qty = round_quantity(SYMBOL, total_qty * 0.99)
 
                     if sell_qty > 0:
-                        write_log(f"Satış sinyali: fiyat {current}, hedef {target}, stop {stop}")
+                        reason = "Kâr Alımı" if current >= target else "Stop-Loss"
+                        write_log(f"Satış sinyali ({reason}): fiyat {current}, hedef {target}, stop {stop}")
                         order = place_order(SYMBOL, SIDE_SELL, sell_qty, current)
                         if order:
                             sell = get_avg_fill_price(order) or current
                             pnl = calc_pnl(entry_price, sell)
                             result = "Kâr" if sell >= entry_price else "Zarar"
-                            write_log(f"{result}: {sell_qty} AVAX satıldı @ {sell} | PnL: {round(pnl, 3)}")
+                            write_log(f"{result}: {sell_qty} BTC satıldı @ {sell} | PnL: {round(pnl, 3)}")
+                            send_telegram(f"🏁 {result}: {sell_qty} BTC satıldı @ {sell}")
                             in_position = False
                             entry_price = 0.0
+                            adjusted_stop = False
                             save_state({"in_position": False, "entry_price": 0.0})
                         else:
                             write_log("Satış emri başarısız oldu.")
                     else:
-                        write_log("Satış için yeterli AVAX yok.")
+                        write_log("Satış için yeterli BTC yok.")
 
         except Exception as e:
             write_log_limited(f"Hata - döngü: {e}", key="loop_error")
