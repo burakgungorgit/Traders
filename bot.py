@@ -88,7 +88,7 @@ client = Client(API_KEY, API_SECRET)
 client.time_offset = -get_time_offset_ms()
 
 # --- Bot ayarları ---
-SYMBOL = "BTCUSDT"
+SYMBOL = "SOLUSDT"
 INTERVAL = Client.KLINE_INTERVAL_30MINUTE
 COMMISSION = 0.001
 MIN_USDT = 10
@@ -96,10 +96,10 @@ MIN_USDT = 10
 # --- Strateji parametreleri ---
 EMA_SHORT = 150
 EMA_LONG = 200
-TAKE_PROFIT_MULT = 1.08
-STOP_LOSS_MULT = 0.97
-STOPLOSS_ADJUST_TRIGGER = 1.05
-STOPLOSS_ADJUST_TO = 1.03
+STOP_LOSS_MULT = 0.97  # -%3
+FIRST_SELL_TRIGGER = 1.05  # +%5
+FIRST_SELL_STOP = 1.02     # SL güncellemesi
+SECOND_SELL_TRIGGER = 1.09 # +%9
 
 # --- Bakiye kontrolü ---
 def get_balance(asset):
@@ -187,14 +187,13 @@ def calc_pnl(entry, current): return sell_price(current) - buy_price(entry)
 
 # --- Ana döngü ---
 def main():
-    write_log("BTCUSDT Bot başlatıldı.")
+    write_log("BTCUSDT Bot başlatıldı (Dinamik Satış Sistemi).")
     state = load_state()
     in_position = state["in_position"]
     entry_price = state["entry_price"]
-    write_log(f"Başlangıç durumu: in_position={in_position}, entry_price={entry_price}")
+    half_sold = state.get("half_sold", False)
     awaiting_confirmation = False
     signal_time = None
-    adjusted_stop = False
 
     while True:
         try:
@@ -207,6 +206,7 @@ def main():
             df["ema_long"] = calculate_ema(df, EMA_LONG)
             prev, last = df.iloc[-2], df.iloc[-1]
 
+            # --- Alım sinyali ---
             if not in_position and not awaiting_confirmation:
                 if prev["ema_short"] < prev["ema_long"] and last["ema_short"] > last["ema_long"]:
                     write_log("Sinyal oluştu. Mum kapanışı bekleniyor.")
@@ -224,53 +224,58 @@ def main():
                             if order:
                                 entry_price = get_avg_fill_price(order)
                                 in_position = True
-                                save_state({"in_position": True, "entry_price": entry_price})
+                                half_sold = False
+                                save_state({"in_position": True, "entry_price": entry_price, "half_sold": False})
                                 write_log(f"✅ Alım yapıldı: {qty} BTC @ {entry_price}")
-                                send_telegram(f"✅ ALIM: {qty} BTC @ {entry_price}")
                         else:
                             write_log("Yetersiz bakiye.")
                     else:
                         write_log("Sinyal geçersizleşti.")
                     awaiting_confirmation = False
 
+            # --- Satış yönetimi ---
             elif in_position:
                 current = float(client.get_symbol_ticker(symbol=SYMBOL)["price"])
-                target = entry_price * TAKE_PROFIT_MULT
-                stop = entry_price * STOP_LOSS_MULT
+                btc_balance = get_balance("BTC")
 
-                # Stop-loss ayarlaması (fiyat +%5’e ulaşırsa SL = entry*1.03)
-                if current >= entry_price * STOPLOSS_ADJUST_TRIGGER and not adjusted_stop:
-                    adjusted_stop = True
-                    stop = entry_price * STOPLOSS_ADJUST_TO
-                    write_log(f"🔒 Fiyat %5 yükseldi. SL {stop:.4f} seviyesine çekildi.")
-                    send_telegram(f"🔒 STOPLOSS GÜNCELLENDİ: Yeni SL = {stop:.4f}")
-
-                if current >= target or current <= stop:
-                    total_qty = get_balance("BTC")
-                    sell_qty = round_quantity(SYMBOL, total_qty * 0.99)
-
+                # %3 düşüş -> tüm satış (stop-loss)
+                if current <= entry_price * STOP_LOSS_MULT:
+                    sell_qty = round_quantity(SYMBOL, btc_balance)
                     if sell_qty > 0:
-                        reason = "Kâr Alımı" if current >= target else "Stop-Loss"
-                        write_log(f"Satış sinyali ({reason}): fiyat {current}, hedef {target}, stop {stop}")
-                        order = place_order(SYMBOL, SIDE_SELL, sell_qty, current)
-                        if order:
-                            sell = get_avg_fill_price(order) or current
-                            pnl = calc_pnl(entry_price, sell)
-                            result = "Kâr" if sell >= entry_price else "Zarar"
-                            write_log(f"{result}: {sell_qty} BTC satıldı @ {sell} | PnL: {round(pnl, 3)}")
-                            send_telegram(f"🏁 {result}: {sell_qty} BTC satıldı @ {sell}")
-                            in_position = False
-                            entry_price = 0.0
-                            adjusted_stop = False
-                            save_state({"in_position": False, "entry_price": 0.0})
-                        else:
-                            write_log("Satış emri başarısız oldu.")
-                    else:
-                        write_log("Satış için yeterli BTC yok.")
+                        write_log(f"🛑 Stop-loss tetiklendi @ {current}")
+                        place_order(SYMBOL, SIDE_SELL, sell_qty, current)
+                        in_position = False
+                        entry_price = 0.0
+                        half_sold = False
+                        save_state({"in_position": False, "entry_price": 0.0, "half_sold": False})
+                        send_telegram("🛑 STOP-LOSS: Tüm BTC satıldı.")
+                        continue
+
+                # %5 artış -> yarısı satılır, SL ayarlanır
+                if not half_sold and current >= entry_price * FIRST_SELL_TRIGGER:
+                    sell_qty = round_quantity(SYMBOL, btc_balance * 0.5)
+                    if sell_qty > 0:
+                        write_log(f"📈 Fiyat %5 arttı. %50 satış yapılıyor @ {current}")
+                        place_order(SYMBOL, SIDE_SELL, sell_qty, current)
+                        half_sold = True
+                        entry_price = entry_price * FIRST_SELL_STOP  # SL güncelleme
+                        save_state({"in_position": True, "entry_price": entry_price, "half_sold": True})
+                        send_telegram(f"📈 %5 kârda %50 satış. Yeni SL = {entry_price:.2f}")
+
+                # %10 artış -> kalan satılır
+                elif half_sold and current >= entry_price * (SECOND_SELL_TRIGGER / FIRST_SELL_STOP):
+                    sell_qty = round_quantity(SYMBOL, btc_balance)
+                    if sell_qty > 0:
+                        write_log(f"🚀 Fiyat %10 arttı. Kalan BTC satılıyor @ {current}")
+                        place_order(SYMBOL, SIDE_SELL, sell_qty, current)
+                        in_position = False
+                        entry_price = 0.0
+                        half_sold = False
+                        save_state({"in_position": False, "entry_price": 0.0, "half_sold": False})
+                        send_telegram("🚀 %10 kârda kalan BTC satıldı.")
 
         except Exception as e:
-            write_log_limited(f"Hata - döngü: {e}", key="loop_error")
-            write_log_limited("İnternet kopmuş olabilir. 60 saniye bekleniyor...", key="internet_wait")
+            write_log(f"Hata: {e}")
             time.sleep(60)
             continue
 
@@ -278,5 +283,4 @@ def main():
 
 # --- Başlat ---
 if __name__ == "__main__":
-    print_balances()
     main()
